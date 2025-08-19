@@ -198,7 +198,7 @@ if "start_date" not in st.session_state:
 if "end_date" not in st.session_state:
     st.session_state.end_date = date.today()
 if "report" not in st.session_state:
-    st.session_state.report = {}  # we’ll stash exportables here
+    st.session_state.report = {}  # exportables
 
 # -----------------------------
 # Tabs
@@ -399,14 +399,25 @@ with tab_results:
     if abs(pd.to_numeric(assets.get("Benchmark Weight %", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() - 100) > 1e-6:
         st.error("Benchmark Weights must sum to 100%."); st.stop()
 
+    # Clean numbers
     assets["Beginning MV"] = assets["Beginning MV"].apply(to_float).fillna(0.0)
     assets["Ending MV"] = assets["Ending MV"].apply(to_float).fillna(0.0)
     assets["Benchmark Weight %"] = assets["Benchmark Weight %"].apply(to_float).fillna(0.0)
     assets["Benchmark Return %"] = assets["Benchmark Return %"].apply(to_float).fillna(0.0)
 
-    if assets["Beginning MV"].sum() <= 0:
-        st.error("Total Beginning MV must be > 0."); st.stop()
+    # --- tolerant BV check (new) ---
+    total_bv = assets["Beginning MV"].sum()
+    total_ev = assets["Ending MV"].sum()
+    if total_bv <= 0:
+        if st.session_state.flows.empty:
+            st.error(
+                "Total Beginning MV is 0 and there are no cashflows. "
+                "Either enter Beginning MV > 0 in Global Settings or upload cashflows (INFLOWs) for purchases."
+            )
+            st.stop()
+        # else: proceed; weights will be 0 and portfolio Dietz will rely on flows
 
+    # Build flows frame for Dietz calc
     flows = st.session_state.flows.copy()
     if not flows.empty:
         flows["when"] = pd.to_datetime(flows["Transaction Date"], errors="coerce").dt.tz_localize(None)
@@ -417,8 +428,6 @@ with tab_results:
 
     t0 = datetime.combine(st.session_state.start_date, datetime.min.time())
     t1 = datetime.combine(st.session_state.end_date, datetime.max.time())
-
-    total_bv = assets["Beginning MV"].sum()
 
     # Per-class Dietz (tolerant; collect issues)
     issues = []
@@ -453,10 +462,11 @@ with tab_results:
         wP = 0.0 if total_bv <= 0 else bv / total_bv
         class_rows.append({"name": name, "wP": wP, "wB": wB, "rP": rP, "rB": rB, "bv": bv, "ev": ev})
 
+    # Portfolio Dietz
     ev_port = sum(c["ev"] for c in class_rows)
     flows_port = flows[["when", "amount"]].copy() if not flows.empty else pd.DataFrame(columns=["when", "amount"])
     try:
-        r_port = modified_dietz(total_bv, ev_port, flows_port, t0, t1)
+        r_port = modified_dietz(max(total_bv, 0.0), ev_port, flows_port, t0, t1)
     except Exception as e:
         st.error(f"Portfolio Dietz error → {e}"); st.stop()
 
@@ -480,7 +490,7 @@ with tab_results:
 
     if issues: st.warning("Data issues detected:\n- " + "\n- ".join(issues))
 
-    # Save for export (Results tab)
+    # Save for export
     st.session_state.report.update({
         "period": (st.session_state.start_date, st.session_state.end_date),
         "metrics": {"Portfolio": r_port, "Benchmark": r_bench, "Excess": excess},
@@ -516,11 +526,10 @@ with tab_reporting:
     c3.metric("Net Flows", f"{net_flows:,.0f}")
     c4.metric("# Asset Classes", f"{n_assets}")
 
-    # --- B) Contribution bars
+    # --- Contribution bars
     st.markdown("#### Contribution to Active Return by Asset Class")
     contrib = pd.DataFrame()
     if not assets.empty:
-        # Quick recompute to get contributions
         assets_calc = assets.copy()
         assets_calc["Beginning MV"] = assets_calc["Beginning MV"].apply(to_float).fillna(0.0)
         assets_calc["Ending MV"] = assets_calc["Ending MV"].apply(to_float).fillna(0.0)
@@ -562,7 +571,7 @@ with tab_reporting:
     else:
         st.info("Add assets in Global Settings to see contributions.")
 
-    # --- C) Cashflow analytics
+    # --- Cashflow analytics
     st.markdown("#### Cashflow Analytics")
     if flows.empty:
         st.info("No cashflows loaded.")
@@ -586,7 +595,7 @@ with tab_reporting:
         cf_ts = cf.set_index("Transaction Date")["signed"].resample("W").sum().fillna(0)
         st.line_chart(cf_ts)
 
-    # --- D) Optional: time-series TWRR (Valuations CSV)
+    # --- Optional: time-series TWRR (Valuations CSV)
     st.markdown("#### Optional: Upload Valuations CSV for Chain-Linked TWRR")
     st.caption("Headers: **Date, Asset Class, Market Value** (period ends).")
     if not assets.empty:
@@ -659,7 +668,6 @@ with tab_reporting:
 
     # ========== EXPORT ==========
     st.markdown("### Export")
-    # Prepare export payload
     report_payload = {
         "period": st.session_state.report.get("period"),
         "metrics": st.session_state.report.get("metrics"),
@@ -667,16 +675,15 @@ with tab_reporting:
         "contrib": contrib.copy(),
         "assets": st.session_state.report.get("assets", pd.DataFrame()),
         "flows": st.session_state.report.get("flows", pd.DataFrame()),
-        "cf_by_type": cf_by_type.copy(),
-        "cf_by_asset": cf_by_asset.copy(),
-        "cf_ts": cf_ts.copy(),
+        "cf_by_type": locals().get("cf_by_type", pd.DataFrame()).copy(),
+        "cf_by_asset": locals().get("cf_by_asset", pd.DataFrame()).copy(),
+        "cf_ts": locals().get("cf_ts", pd.Series(dtype=float)).copy(),
         "timeseries": ts_res,  # may be {}
     }
 
     def build_excel_bytes(rep: dict) -> bytes:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-            # Summary
             period = rep.get("period", (None, None))
             metr = rep.get("metrics", {})
             summary = pd.DataFrame({
@@ -690,14 +697,12 @@ with tab_reporting:
                 ],
             })
             summary.to_excel(xw, sheet_name="Summary", index=False)
-
             rep.get("attrib", pd.DataFrame()).to_excel(xw, sheet_name="Attribution", index=False)
             rep.get("contrib", pd.DataFrame()).to_excel(xw, sheet_name="Contributions", index=False)
             rep.get("assets", pd.DataFrame()).to_excel(xw, sheet_name="Assets", index=False)
             rep.get("flows", pd.DataFrame()).to_excel(xw, sheet_name="Cashflows", index=False)
             rep.get("cf_by_type", pd.DataFrame()).to_excel(xw, sheet_name="CF By Type", index=False)
             rep.get("cf_by_asset", pd.DataFrame()).to_excel(xw, sheet_name="CF By Asset", index=False)
-            # Time series (if any)
             ts = rep.get("timeseries", {})
             if ts and "r_port" in ts:
                 pd.DataFrame({"Portfolio": ts["r_port"]}).to_excel(xw, sheet_name="Period Returns", index=True)
@@ -712,53 +717,40 @@ with tab_reporting:
         doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
         styles = getSampleStyleSheet()
         els = []
-        # Title
         els.append(Paragraph("MDTWRR Performance Report", styles["Title"]))
         period = rep.get("period", (None, None))
         els.append(Paragraph(f"Period: {period[0]} → {period[1]}", styles["Normal"]))
         els.append(Spacer(1, 8))
-
         metr = rep.get("metrics", {})
         mt = [["Metric", "Value"],
               ["Portfolio Return (Dietz)", pct(metr.get("Portfolio"))],
               ["Benchmark Return", pct(metr.get("Benchmark"))],
               ["Excess Return", pct(metr.get("Excess"))]]
         table = Table(mt, hAlign="LEFT")
-        table.setStyle(TableStyle([("BACKGROUND",(0,0),(1,0), colors.lightgrey),
+        table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
                                    ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
                                    ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold")]))
-        els.append(table)
-        els.append(Spacer(1, 12))
-
-        # Attribution (top 15 rows)
+        els.append(table); els.append(Spacer(1, 12))
         attrib = rep.get("attrib", pd.DataFrame())
         if not attrib.empty:
             els.append(Paragraph("Attribution (Top Contributors)", styles["Heading2"]))
             top = attrib.copy()
-            if "Total" in top["Sector"].values:
-                top = top[top["Sector"] != "Total"]
+            if "Total" in top["Sector"].values: top = top[top["Sector"] != "Total"]
             top = top.sort_values("Total Active", ascending=False).head(15)
-            data = [list(["Sector","Portfolio Weight","Benchmark Weight","Portfolio Return","Benchmark Return","Asset Allocation","Stock Selection","Market Timing","Total Active"])]
+            data = [["Sector","Portfolio Weight","Benchmark Weight","Portfolio Return","Benchmark Return",
+                     "Asset Allocation","Stock Selection","Market Timing","Total Active"]]
             data += [[
-                r["Sector"],
-                f"{r['Portfolio Weight']:.4f}",
-                f"{r['Benchmark Weight']:.4f}",
-                f"{r['Portfolio Return']:.4f}",
-                f"{r['Benchmark Return']:.4f}",
-                f"{r['Asset Allocation']:.4f}",
-                f"{r['Stock Selection']:.4f}",
-                f"{r['Market Timing']:.4f}",
-                f"{r['Total Active']:.4f}",
+                r["Sector"], f"{r['Portfolio Weight']:.4f}", f"{r['Benchmark Weight']:.4f}",
+                f"{r['Portfolio Return']:.4f}", f"{r['Benchmark Return']:.4f}",
+                f"{r['Asset Allocation']:.4f}", f"{r['Stock Selection']:.4f}",
+                f"{r['Market Timing']:.4f}", f"{r['Total Active']:.4f}",
             ] for _, r in top.iterrows()]
             t = Table(data, hAlign="LEFT")
             t.setStyle(TableStyle([("FONTSIZE",(0,0),(-1,-1),8),
                                    ("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
                                    ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
                                    ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold")]))
-            els.append(t)
-            els.append(Spacer(1, 12))
-
-        # Cashflow summary
+            els.append(t); els.append(Spacer(1, 12))
         cf_by_type = rep.get("cf_by_type", pd.DataFrame())
         if not cf_by_type.empty:
             els.append(Paragraph("Cashflows by Type", styles["Heading2"]))
@@ -766,9 +758,7 @@ with tab_reporting:
             t = Table(data, hAlign="LEFT")
             t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
                                    ("GRID",(0,0),(-1,-1), 0.25, colors.grey)]))
-            els.append(t)
-            els.append(Spacer(1, 8))
-
+            els.append(t); els.append(Spacer(1, 8))
         cf_by_asset = rep.get("cf_by_asset", pd.DataFrame())
         if not cf_by_asset.empty:
             els.append(Paragraph("Net Cashflows by Asset Class", styles["Heading2"]))
@@ -776,10 +766,7 @@ with tab_reporting:
             t = Table(data, hAlign="LEFT")
             t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
                                    ("GRID",(0,0),(-1,-1), 0.25, colors.grey)]))
-            els.append(t)
-            els.append(Spacer(1, 8))
-
-        # Timeseries (if present)
+            els.append(t); els.append(Spacer(1, 8))
         ts = rep.get("timeseries", {})
         if ts and "r_port" in ts:
             els.append(Paragraph("Per-Period Returns (Portfolio)", styles["Heading2"]))
@@ -789,13 +776,11 @@ with tab_reporting:
                                    ("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
                                    ("GRID",(0,0),(-1,-1), 0.25, colors.grey)]))
             els.append(t)
-
         doc.build(els)
         return buf.getvalue()
 
-    # Download buttons
     xls_bytes = build_excel_bytes(report_payload)
-    st.download_button("⬇️ Download Excel Report", xls_bytes, "MDTWRR_Report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+    st.download_button("⬇️ Download Excel Report", xls_bytes, "MDTWRR_Report.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     pdf_bytes = build_pdf_bytes(report_payload)
     st.download_button("⬇️ Download PDF Summary", pdf_bytes, "MDTWRR_Summary.pdf", "application/pdf")
