@@ -43,27 +43,31 @@ def read_csv_robust(uploaded_file) -> pd.DataFrame:
 
 def modified_dietz(bv: float, ev: float, flows: pd.DataFrame, t0: datetime, t1: datetime, eps=1e-12) -> float:
     """
-    R = (EV - BV - sum(CF)) / (BV + sum(w_i * CF_i)), w_i = (t1 - t_i)/(t1 - t0)
-    flows: ['when','amount'] signed (+ INFLOW, - OUTFLOW). Returns decimal (0.12 = 12%).
+    R = (EV - BV - sum(CF)) / (BV + sum(w_i * CF_i)),  w_i = (t1 - t_i)/(t1 - t0)
+    Include flows on Start Date (t_i == t0) with weight = 1.0; flows on End Date (t_i == t1) get weight = 0.0.
     """
     if not np.isfinite(bv) or not np.isfinite(ev):
         raise ValueError("BV/EV must be finite")
     if not (isinstance(t0, datetime) and isinstance(t1, datetime) and t1 > t0):
         raise ValueError("Bad dates")
     T = (t1 - t0).total_seconds()
-    if T <= 0: raise ValueError("Zero/negative period")
+    if T <= 0:
+        raise ValueError("Zero/negative period")
 
-    f = pd.DataFrame(columns=["when","amount"]) if flows is None else flows.copy()
+    f = pd.DataFrame(columns=["when", "amount"]) if flows is None else flows.copy()
     if not f.empty:
-        f = f[(f["when"] > t0) & (f["when"] <= t1)]
+        # >>> key change: include start-date flows (>= t0) instead of (> t0)
+        f = f[(f["when"] >= t0) & (f["when"] <= t1)]
         f = f[np.isfinite(f["amount"])]
 
     sum_cf = 0.0 if f.empty else f["amount"].sum()
+
     denom = bv
     if not f.empty:
-        f["w"] = f["when"].apply(lambda w: clamp01((t1 - w).total_seconds() / T))
+        f["w"] = f["when"].apply(lambda w: max(0.0, min(1.0, (t1 - w).total_seconds() / T)))
         denom += (f["w"] * f["amount"]).sum()
-    if abs(denom) < eps:  # avoid explosions
+
+    if abs(denom) < eps:
         raise ValueError("Unstable denominator")
 
     numer = ev - bv - sum_cf
