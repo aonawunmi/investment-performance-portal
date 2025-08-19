@@ -1,13 +1,10 @@
 # app.py
-# --------------------------------------------------------------------
-# MDTWRR Investment Performance Portal (Streamlit) — CSV-enabled
-# Run locally:  pip install streamlit pandas numpy
-# Start:        streamlit run app.py
-# --------------------------------------------------------------------
+# MDTWRR Performance Portal (Streamlit) — robust CSV + tolerant Dietz
+# Run: pip install streamlit pandas numpy
+# Start: streamlit run app.py
 
-import io
 from datetime import datetime, date, timedelta
-
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,24 +28,30 @@ def to_float(x):
     except Exception:
         return np.nan
 
-def clamp01(x):
-    return max(0.0, min(1.0, x))
+def clamp01(x): return max(0.0, min(1.0, x))
+
+def read_csv_robust(uploaded_file):
+    """Read a CSV with tolerant encoding & delimiter sniffing."""
+    raw = uploaded_file.getvalue()  # bytes
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1", "iso-8859-1", "utf-16", "utf-16le", "utf-16be"]
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python")
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or ValueError("Unknown CSV encoding")
 
 def modified_dietz(bv, ev, flows_df, t0, t1, eps=1e-12):
-    """
-    bv, ev: floats
-    flows_df: DataFrame with columns ["when", "amount"] where amount is signed (+in, -out)
-              and t0 < when <= t1
-    t0, t1: datetime (t1 > t0)
-    """
+    """Modified Dietz: t0 < when <= t1, amount signed (+in, -out)."""
     if not (isinstance(t0, datetime) and isinstance(t1, datetime) and t1 > t0):
         raise ValueError("Bad dates for Dietz calculation")
     if not np.isfinite(bv) or not np.isfinite(ev):
         raise ValueError("BV/EV must be finite")
 
     T = (t1 - t0).total_seconds()
-    if T <= 0:
-        raise ValueError("Zero/negative period length")
+    if T <= 0: raise ValueError("Zero/negative period length")
 
     if flows_df is None or flows_df.empty:
         denom = bv
@@ -65,23 +68,17 @@ def modified_dietz(bv, ev, flows_df, t0, t1, eps=1e-12):
         f["w"] = f["when"].apply(lambda w: clamp01((t1 - w).total_seconds() / T))
         denom += (f["w"] * f["amount"]).sum()
 
-    if abs(denom) < eps:
-        raise ValueError("Unstable denominator; split period or check flows")
-
+    if abs(denom) < eps: raise ValueError("Unstable denominator; split period or check flows")
     numer = ev - bv - sum_cf
     return numer / denom
 
 def brinson_attribution(rows):
-    """
-    rows: list of dicts per asset class with:
-      name, wP, wB, rP, rB
-    Returns DataFrame with Allocation, Selection, Timing, Active per class + totals row.
-    """
+    """BHB with interaction as Market Timing."""
     recs = []
     for x in rows:
         alloc = (x["wP"] - x["wB"]) * x["rB"]
         select = x["wB"] * (x["rP"] - x["rB"])
-        timing = (x["wP"] - x["wB"]) * (x["rP"] - x["rB"])  # interaction
+        timing = (x["wP"] - x["wB"]) * (x["rP"] - x["rB"])
         active = alloc + select + timing
         recs.append({
             "Sector": x["name"],
@@ -94,7 +91,6 @@ def brinson_attribution(rows):
             "Market Timing": timing,
             "Total Active": active,
         })
-
     df = pd.DataFrame(recs)
     if not df.empty:
         totals = {
@@ -111,13 +107,10 @@ def brinson_attribution(rows):
         df = pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
     return df
 
-def pct(x, dp=2):
-    if pd.isna(x):
-        return "-"
-    return f"{x*100:.{dp}f}%"
+def pct(x, dp=2): return "-" if pd.isna(x) else f"{x*100:.{dp}f}%"
 
 # -----------------------------
-# Session state defaults
+# Session defaults
 # -----------------------------
 if "assets" not in st.session_state:
     st.session_state.assets = pd.DataFrame(
@@ -133,42 +126,33 @@ if "end_date" not in st.session_state:
     st.session_state.end_date = date.today()
 
 # -----------------------------
-# Tabs (pages)
+# Tabs
 # -----------------------------
 tab_settings, tab_cashflows, tab_results = st.tabs(["1) Global Settings", "2) Cashflow Upload", "3) Results"])
 
 # =============================
-# 1) GLOBAL SETTINGS  (CSV-enabled)
+# 1) GLOBAL SETTINGS (CSV-enabled)
 # =============================
 with tab_settings:
     st.subheader("Period")
-    colA, colB = st.columns([1,1])
-    with colA:
-        st.session_state.start_date = st.date_input(
-            "Start Date", value=st.session_state.start_date, key="start_date_input"
-        )
-    with colB:
-        st.session_state.end_date = st.date_input(
-            "End Date", value=st.session_state.end_date, key="end_date_input"
-        )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.start_date = st.date_input("Start Date", value=st.session_state.start_date, key="start_date_input")
+    with c2:
+        st.session_state.end_date = st.date_input("End Date", value=st.session_state.end_date, key="end_date_input")
 
     st.markdown("#### Load Period via CSV (optional)")
-    st.caption("One row with headers **Start Date, End Date**. Example: 2025-06-01, 2025-06-30")
+    st.caption("One row with headers **Start Date, End Date**.")
     period_sample = pd.DataFrame([{
         "Start Date": (date.today().replace(day=1)).isoformat(),
         "End Date": date.today().isoformat(),
     }])
-    st.download_button(
-        "Download Period CSV Template",
-        period_sample.to_csv(index=False).encode("utf-8"),
-        "period_template.csv",
-        "text/csv",
-        key="dl_period_tpl",
-    )
+    st.download_button("Download Period CSV Template", period_sample.to_csv(index=False).encode("utf-8"),
+                       "period_template.csv", "text/csv", key="dl_period_tpl")
     period_file = st.file_uploader("Upload Period CSV (optional)", type=["csv"], key="period_csv")
     if period_file is not None:
         try:
-            pdf = pd.read_csv(period_file)
+            pdf = read_csv_robust(period_file)
             rename_map = {}
             for c in pdf.columns:
                 k = c.strip().lower()
@@ -191,7 +175,12 @@ with tab_settings:
     st.markdown("#### Asset Classes")
     st.caption("Enter manually **or** load from CSV. Required headers below.")
 
-    # Templates & uploader for Assets CSV
+    # Flexible header matching utilities
+    def _canon(s: str) -> str:
+        return "".join(ch for ch in str(s).lower().strip() if ch.isalnum())
+    def _match(col: str, targets: list[str]) -> bool:
+        c = _canon(col); return any(t in c for t in targets)
+
     assets_tpl = pd.DataFrame({
         "Asset Class": ["Equity","Fixed Income","Real Estate"],
         "Beginning MV": [1_000_000, 500_000, 250_000],
@@ -199,32 +188,21 @@ with tab_settings:
         "Benchmark Weight %": [60, 30, 10],
         "Benchmark Return %": [2.5, 1.0, 1.2],
     })
-    st.download_button(
-        "Download Assets CSV Template",
-        assets_tpl.to_csv(index=False).encode("utf-8"),
-        "assets_template.csv",
-        "text/csv",
-        key="dl_assets_tpl",
-    )
+    st.download_button("Download Assets CSV Template", assets_tpl.to_csv(index=False).encode("utf-8"),
+                       "assets_template.csv", "text/csv", key="dl_assets_tpl")
 
     assets_file = st.file_uploader("Upload Assets CSV", type=["csv"], key="assets_csv")
     if assets_file is not None:
         try:
-            df = pd.read_csv(assets_file)
-            # Normalize headers (case-insensitive)
+            df = read_csv_robust(assets_file)
+            st.caption(f"Detected columns: {list(df.columns)}")
             rename = {}
             for c in df.columns:
-                k = c.strip().lower()
-                if k in ("asset class","asset_class","class"):
-                    rename[c] = "Asset Class"
-                elif k in ("beginning mv","beginning value","bv","begin mv"):
-                    rename[c] = "Beginning MV"
-                elif k in ("ending mv","ending value","ev","end mv"):
-                    rename[c] = "Ending MV"
-                elif k in ("benchmark weight %","benchmark weight","bench wt","bw%","bw"):
-                    rename[c] = "Benchmark Weight %"
-                elif k in ("benchmark return %","benchmark return","bench ret","br%","br"):
-                    rename[c] = "Benchmark Return %"
+                if _match(c, ["assetclass","asset","class"]): rename[c] = "Asset Class"
+                elif _match(c, ["beginningmv","beginmv","openingmv","bv","startmv"]): rename[c] = "Beginning MV"
+                elif _match(c, ["endingmv","endmv","closingmv","ev","finishmv"]): rename[c] = "Ending MV"
+                elif _match(c, ["benchmarkweight","benchweight","bmweight","bw","weightpct","weightpercent","weight%"]): rename[c] = "Benchmark Weight %"
+                elif _match(c, ["benchmarkreturn","benchreturn","bmreturn","indexreturn","br","retpct","returnpercent","return%"]): rename[c] = "Benchmark Return %"
             df = df.rename(columns=rename)
 
             required = ["Asset Class","Beginning MV","Ending MV","Benchmark Weight %","Benchmark Return %"]
@@ -233,13 +211,13 @@ with tab_settings:
                 st.error(f"Missing columns: {missing}")
             else:
                 for col in ["Beginning MV","Ending MV","Benchmark Weight %","Benchmark Return %"]:
-                    df[col] = df[col].apply(lambda x: to_float(x))
+                    df[col] = df[col].apply(to_float)
                 st.session_state.assets = df[required].copy()
                 st.success("Assets loaded from CSV")
         except Exception as e:
             st.error(f"Could not read Assets CSV: {e}")
 
-    # Manual editor (still available; CSV just pre-fills it)
+    # Manual editor (CSV pre-fills it)
     assets_df = st.data_editor(
         st.session_state.assets,
         num_rows="dynamic",
@@ -255,14 +233,8 @@ with tab_settings:
     )
     st.session_state.assets = assets_df
 
-    # Weight sum check
-    bw_sum = pd.to_numeric(
-        assets_df.get("Benchmark Weight %", pd.Series(dtype=float)), errors="coerce"
-    ).fillna(0).sum()
-    st.info(
-        f"Benchmark weights sum: **{bw_sum:.2f}%**"
-        + (" ✅" if abs(bw_sum - 100) < 1e-6 else " ⚠️ should be 100%")
-    )
+    bw_sum = pd.to_numeric(assets_df.get("Benchmark Weight %", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+    st.info(f"Benchmark weights sum: **{bw_sum:.2f}%**" + (" ✅" if abs(bw_sum - 100) < 1e-6 else " ⚠️ should be 100%"))
 
 # =============================
 # 2) CASHFLOWS
@@ -278,33 +250,26 @@ with tab_cashflows:
         "Amount": [100000.00, 2000.00],
         "Asset Class": ["Equity", "Equity"],
     })
-    st.download_button("Download Cashflows CSV Template",
-                       sample.to_csv(index=False).encode("utf-8"),
+    st.download_button("Download Cashflows CSV Template", sample.to_csv(index=False).encode("utf-8"),
                        "cashflows_template.csv", "text/csv")
 
     file = st.file_uploader("Choose CSV file", type=["csv"])
     if file is not None:
         try:
-            df = pd.read_csv(file)
+            df = read_csv_robust(file)
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
             df = None
 
         if df is not None:
-            # Normalize columns (case-insensitive match)
             rename_map = {}
             for col in df.columns:
                 c = col.strip().lower()
-                if c in ("transaction date", "date"):
-                    rename_map[col] = "Transaction Date"
-                elif c in ("transaction type", "type"):
-                    rename_map[col] = "Transaction Type"
-                elif c in ("transaction details", "details", "description"):
-                    rename_map[col] = "Transaction Details"
-                elif c in ("amount",):
-                    rename_map[col] = "Amount"
-                elif c in ("asset class", "assetclass", "class"):
-                    rename_map[col] = "Asset Class"
+                if c in ("transaction date", "date"): rename_map[col] = "Transaction Date"
+                elif c in ("transaction type", "type"): rename_map[col] = "Transaction Type"
+                elif c in ("transaction details", "details", "description"): rename_map[col] = "Transaction Details"
+                elif c in ("amount",): rename_map[col] = "Amount"
+                elif c in ("asset class", "assetclass", "class"): rename_map[col] = "Asset Class"
             df = df.rename(columns=rename_map)
 
             required = ["Transaction Date", "Transaction Type", "Transaction Details", "Amount", "Asset Class"]
@@ -325,8 +290,7 @@ with tab_cashflows:
 
                 for i, r in df.iterrows():
                     if pd.isna(r["Transaction Date"]):
-                        errs.append(f"Row {i+1}: bad date")
-                        continue
+                        errs.append(f"Row {i+1}: bad date"); continue
                     if not (t0 < r["Transaction Date"] <= t1):
                         errs.append(f"Row {i+1}: date outside Start/End")
                     if r["Transaction Type"] not in ALLOWED_TYPES:
@@ -353,28 +317,20 @@ with tab_results:
 
     assets = st.session_state.assets.copy()
     if assets.empty:
-        st.warning("Add or upload Asset Classes in Global Settings.")
-        st.stop()
-
+        st.warning("Add or upload Asset Classes in Global Settings."); st.stop()
     if st.session_state.start_date >= st.session_state.end_date:
-        st.error("End Date must be after Start Date.")
-        st.stop()
-
+        st.error("End Date must be after Start Date."); st.stop()
     if abs(pd.to_numeric(assets.get("Benchmark Weight %", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() - 100) > 1e-6:
-        st.error("Benchmark Weights must sum to 100%.")
-        st.stop()
+        st.error("Benchmark Weights must sum to 100%."); st.stop()
 
-    # Clean numbers
     assets["Beginning MV"] = assets["Beginning MV"].apply(to_float).fillna(0.0)
     assets["Ending MV"] = assets["Ending MV"].apply(to_float).fillna(0.0)
     assets["Benchmark Weight %"] = assets["Benchmark Weight %"].apply(to_float).fillna(0.0)
     assets["Benchmark Return %"] = assets["Benchmark Return %"].apply(to_float).fillna(0.0)
 
     if assets["Beginning MV"].sum() <= 0:
-        st.error("Total Beginning MV must be > 0.")
-        st.stop()
+        st.error("Total Beginning MV must be > 0."); st.stop()
 
-    # Build flows df (signed)
     flows = st.session_state.flows.copy()
     if not flows.empty:
         flows["when"] = pd.to_datetime(flows["Transaction Date"], errors="coerce").dt.tz_localize(None)
@@ -388,7 +344,8 @@ with tab_results:
 
     total_bv = assets["Beginning MV"].sum()
 
-    # Per-class Dietz
+    # Per-class Dietz (tolerant; collect issues)
+    issues = []
     class_rows = []
     for _, row in assets.iterrows():
         name = str(row["Asset Class"]).strip()
@@ -396,16 +353,27 @@ with tab_results:
         ev = float(row["Ending MV"])
         wB = float(row["Benchmark Weight %"]) / 100.0
         rB = float(row["Benchmark Return %"]) / 100.0
-
         if name == "" or bv < 0 or ev < 0:
             continue
 
         f_cls = flows[flows["asset"] == name][["when", "amount"]].copy() if not flows.empty else pd.DataFrame(columns=["when", "amount"])
+        has_flows = (not f_cls.empty) and np.isfinite(f_cls["amount"].sum())
+
+        if bv == 0 and not has_flows:
+            if ev == 0:
+                # inactive this period — zero weight/return
+                class_rows.append({"name": name, "wP": 0.0, "wB": wB, "rP": 0.0, "rB": rB, "bv": bv, "ev": ev})
+            else:
+                issues.append(f"{name}: BV is 0 and no cashflows provided; add INFLOW(s) for purchases. Skipped in return calc.")
+                class_rows.append({"name": name, "wP": 0.0, "wB": wB, "rP": 0.0, "rB": rB, "bv": bv, "ev": ev})
+            continue
+
         try:
             rP = modified_dietz(bv, ev, f_cls, t0, t1)
         except Exception as e:
-            st.error(f"{name}: Dietz error → {e}")
-            st.stop()
+            issues.append(f"{name}: Dietz error → {e}. Row ignored in return calc.")
+            class_rows.append({"name": name, "wP": 0.0, "wB": wB, "rP": 0.0, "rB": rB, "bv": bv, "ev": ev})
+            continue
 
         wP = 0.0 if total_bv <= 0 else bv / total_bv
         class_rows.append({"name": name, "wP": wP, "wB": wB, "rP": rP, "rB": rB, "bv": bv, "ev": ev})
@@ -416,13 +384,11 @@ with tab_results:
     try:
         r_port = modified_dietz(total_bv, ev_port, flows_port, t0, t1)
     except Exception as e:
-        st.error(f"Portfolio Dietz error → {e}")
-        st.stop()
+        st.error(f"Portfolio Dietz error → {e}"); st.stop()
 
     r_bench = sum(c["wB"] * c["rB"] for c in class_rows)
     excess = r_port - r_bench
 
-    # Attribution table
     attrib_df = brinson_attribution(class_rows)
 
     # Metrics
@@ -431,20 +397,17 @@ with tab_results:
     m2.metric("Benchmark Return", pct(r_bench))
     m3.metric("Excess Return", pct(excess))
 
-    # Display attribution
+    # Table
     show = attrib_df.copy()
-    pct_cols = [
-        "Portfolio Weight","Benchmark Weight","Portfolio Return","Benchmark Return",
-        "Asset Allocation","Stock Selection","Market Timing","Total Active",
-    ]
-    for c in pct_cols:
-        show[c] = show[c].apply(pct)
+    pct_cols = ["Portfolio Weight","Benchmark Weight","Portfolio Return","Benchmark Return",
+                "Asset Allocation","Stock Selection","Market Timing","Total Active"]
+    for c in pct_cols: show[c] = show[c].apply(pct)
     st.dataframe(show, use_container_width=True)
+
+    # Warnings
+    if issues:
+        st.warning("Data issues detected:\n- " + "\n- ".join(issues))
 
     # Download
     out_csv = attrib_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download Attribution CSV", out_csv, "attribution.csv", "text/csv")
-
-    with st.expander("Per-asset inputs (raw)"):
-        raw = pd.DataFrame(class_rows)
-        st.dataframe(raw, use_container_width=True)
