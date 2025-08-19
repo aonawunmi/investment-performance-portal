@@ -1,3 +1,7 @@
+import streamlit as st
+st.set_page_config(page_title="MDTWRR Performance Portal", layout="wide")
+st.caption("Initializing…")
+
 # app.py — MDTWRR (Modified Dietz) Performance Portal
 # Pages: Global Settings • Cashflows • Adjusted Cashflows • Results
 # Returns: one-period Modified Dietz per asset class, annualized, plus contribution
