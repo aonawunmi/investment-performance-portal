@@ -1,9 +1,6 @@
-# --- Core (required) ---
 streamlit==1.38.0
 pandas==2.2.2
 numpy==1.26.4
 matplotlib==3.9.2
-
-# --- Optional: nicer plots (safe to keep even if unused) ---
 seaborn==0.13.2
 plotly==5.24.1
